@@ -2,17 +2,20 @@
 # ════════════════════════════════════════════════════════════════════════════
 #  نگهبان «مسیر ساب‌لینک»  (Railway 3x-ui)
 #
-#  چرا لازم است؟
-#    سرور ساب پنل (پورت داخلی 2096) هر بار که تنظیمات در پنل ذخیره می‌شود،
-#    مسیر ساب را دوباره از دیتابیس می‌خواند و بلافاصله با مسیر جدید بالا
-#    می‌آید («Sub server restarted successfully» در لاگ). ولی nginx فقط یک‌بار
-#    هنگام بوت مسیر را می‌خواند. نتیجه: به‌محض عوض‌کردن Sub Path در پنل،
-#    ساب‌لینک‌ها ۴۰۴ می‌شوند تا سرویس دوباره دیپلوی شود.
+#  دو کار انجام می‌دهد:
+#   ۱) مسیرهای ساب را از تنظیمات خودِ پنل می‌خواند و nginx را با آن‌ها می‌سازد.
+#      سرور ساب پنل هر بار که تنظیمات ذخیره شود با مسیر جدید بالا می‌آید، ولی
+#      nginx فقط یک‌بار هنگام بوت مسیر را می‌خواند. نتیجه: با عوض‌کردن Sub Path
+#      ساب‌لینک‌ها ۴۰۴ می‌شدند تا سرویس دوباره دیپلوی شود. حالا حداکثر ۱۵ ثانیه
+#      بعد از ذخیره‌ی تنظیمات، nginx خودکار ریلود می‌شود.
 #
-#  این اسکریپت هر چند ثانیه مسیرهای ساب را از دیتابیس پنل می‌خواند، کانفیگ
-#  nginx را از تمپلیت بازمی‌سازد و اگر با کانفیگ فعلی فرق داشت، تست و
-#  «ریلود» می‌کند — بدون Redeploy. اگر کانفیگ جدید معتبر نباشد، کانفیگ فعلی
-#  دست‌نخورده می‌ماند (پنل هرگز به‌خاطر این نگهبان از دست نمی‌رود).
+#   ۲) چند مسیر ممکن را هم‌زمان سرو می‌کند: مسیرِ داخل «Subscription URI»،
+#      «Subscription Path» و مسیر پیش‌فرض (/sub/) — چون پنل ممکن است مسیر ساب را
+#      از Subscription URI بسازد (در فرانت‌اند پنل دقیقاً همین کار انجام می‌شود).
+#      پورت داخلی سرور ساب هم از تنظیمات پنل خوانده می‌شود (پیش‌فرض 2096).
+#
+#  امنیت: اگر کانفیگ جدید معتبر نباشد، اعمال نمی‌شود و کانفیگ فعلی دست‌نخورده
+#  می‌ماند ⇒ پنل هرگز به‌خاطر این نگهبان از دست نمی‌رود.
 #
 #  خاموش‌کردن:  متغیر محیطی  XUI_SUB_WATCH=false
 #  بازهٔ بررسی: متغیر محیطی  SUB_WATCH_INTERVAL=15   (ثانیه)
@@ -49,6 +52,22 @@ _norm_sub_path() {
     printf '%s' "$p"
 }
 
+# ── مسیرِ داخل یک URI (مثل Subscription URI) ───────────────────────────────
+#    پنل وقتی Subscription URI پر باشد، مسیر ساب را از pathname همان می‌سازد.
+_sub_uri_path() {
+    local u r
+    u="$(printf '%s' "$1" | tr -d '\r\n')"
+    [ -n "$u" ] || return 0
+    case "$u" in
+        *://*) r="${u#*://}"; case "$r" in */*) u="/${r#*/}" ;; *) u="/" ;; esac ;;
+        /*) ;;
+        *) u="/$u" ;;
+    esac
+    u="${u%%\?*}"; u="${u%%#*}"
+    [ "$u" = "/" ] && return 0
+    _norm_sub_path "$u"
+}
+
 # ── مسیرهای رزرو‌شده/غیرمجاز ───────────────────────────────────────────────
 _usable_sub_path() {
     case "$1" in
@@ -62,13 +81,14 @@ _usable_sub_path() {
 }
 
 _add_sub_loc() {   # $1=مسیر  $2=برچسب
-    case "$1" in ""|"/") return 0 ;; esac
+    _usable_sub_path "$1" || return 0
     case "$SUB_LOCATIONS" in *"location $1 {"*) return 0 ;; esac
     if [ -n "$SUB_LOCATIONS" ]; then SUB_LOCATIONS="$SUB_LOCATIONS
 "; fi
-    SUB_LOCATIONS="${SUB_LOCATIONS}        # ساب‌لینک ($2) → سرور ساب روی پورت داخلی 2096
+    # ⚠️ متن کامنت باید با خروجی start.sh یکی باشد (مقایسه با cmp) ⇒ بدون برچسب مسیر
+    SUB_LOCATIONS="${SUB_LOCATIONS}        # ساب‌لینک → سرور ساب روی پورت داخلی ${SUB_UPSTREAM_PORT}
         location ${1} {
-            proxy_pass http://127.0.0.1:2096${1};
+            proxy_pass http://127.0.0.1:${SUB_UPSTREAM_PORT}${1};
             proxy_http_version 1.1;
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$client_real_ip;
@@ -78,24 +98,35 @@ _add_sub_loc() {   # $1=مسیر  $2=برچسب
     SUB_PATHS="$SUB_PATHS $1"
 }
 
-# ── ساخت کانفیگ از تمپلیت با مسیرهای فعلی پنل ──────────────────────────────
+# ── ساخت کانفیگ از تمپلیت با تنظیمات فعلی پنل ──────────────────────────────
 _build_conf() {
     SUB_LOCATIONS=""
     SUB_PATHS=""
-    if [ "$(_sqlset subEnable)" = "true" ]; then
-        local p
-        p="$(_norm_sub_path "${SUB_PATH:-$(_sqlset subPath)}")"
-        [ -n "$p" ] || p="/sub/"
-        if _usable_sub_path "$p"; then _add_sub_loc "$p" "اصلی"; else log "⚠️  نگهبان ساب: مسیر «$p» قابل استفاده نیست ⇒ نادیده گرفته شد."; fi
+
+    # پورت داخلی سرور ساب — از تنظیمات پنل (پیش‌فرض 2096)
+    SUB_UPSTREAM_PORT="$(_sqlset subPort)"
+    case "$SUB_UPSTREAM_PORT" in ''|*[!0-9]*) SUB_UPSTREAM_PORT=2096 ;; esac
+
+    if [ "$(_sqlset subEnable)" != "false" ]; then
+        # ۱) مسیرِ داخل Subscription URI (اگر پنل مسیر ساب را از آن بسازد)
+        _add_sub_loc "$(_sub_uri_path "$(_sqlset subURI)")" "URI"
+        # ۲) Subscription Path (یا متغیر SUB_PATH)
+        _add_sub_loc "$(_norm_sub_path "${SUB_PATH:-$(_sqlset subPath)}")" "اصلی"
+        # ۳) مسیر پیش‌فرض
+        _add_sub_loc "/sub/" "پیش‌فرض"
+
         if [ "$(_sqlset subJsonEnable)" = "true" ]; then
-            p="$(_norm_sub_path "${SUB_JSON_PATH:-$(_sqlset subJsonPath)}")"
-            if _usable_sub_path "$p"; then _add_sub_loc "$p" "JSON"; fi
+            _add_sub_loc "$(_sub_uri_path "$(_sqlset subJsonURI)")" "JSON-URI"
+            _add_sub_loc "$(_norm_sub_path "${SUB_JSON_PATH:-$(_sqlset subJsonPath)}")" "JSON"
+            _add_sub_loc "/json/" "JSON-پیش‌فرض"
         fi
         if [ "$(_sqlset subClashEnable)" = "true" ]; then
-            p="$(_norm_sub_path "${SUB_CLASH_PATH:-$(_sqlset subClashPath)}")"
-            if _usable_sub_path "$p"; then _add_sub_loc "$p" "Clash"; fi
+            _add_sub_loc "$(_sub_uri_path "$(_sqlset subClashURI)")" "Clash-URI"
+            _add_sub_loc "$(_norm_sub_path "${SUB_CLASH_PATH:-$(_sqlset subClashPath)}")" "Clash"
+            _add_sub_loc "/clash/" "Clash-پیش‌فرض"
         fi
     fi
+
     export SUB_LOCATIONS
     [ -f "$TEMPLATE" ] || { log "⚠️  نگهبان ساب: تمپلیت nginx پیدا نشد."; return 1; }
     if ! envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < "$TEMPLATE" > "$NEWCONF" 2>/dev/null; then
@@ -123,7 +154,7 @@ while true; do
         else
             mv -f "$NEWCONF" "$CONF"
             if nginx -s reload 2>/tmp/sub_watch_reload.log; then
-                log "🔁 مسیرهای ساب از پنل خوانده شد و nginx ریلود شد — مسیرها:${SUB_PATHS:- (هیچ — ساب خاموش است)}"
+                log "🔁 تنظیمات ساب در پنل عوض شد ⇒ nginx بازسازی و ریلود شد — مسیرها:${SUB_PATHS:- (هیچ — ساب خاموش است)} (پورت داخلی: ${SUB_UPSTREAM_PORT})"
                 fails=0
             else
                 log "⚠️  نگهبان ساب: ریلود nginx ناموفق بود:"
