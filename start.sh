@@ -113,8 +113,32 @@ if [ -n "$IB_PUSH_URL_EFF" ]; then
     IB_HOST="${IB_BASE#*://}"; IB_HOST="${IB_HOST%%/*}"
     IB_QS=""
     case "$IB_PUSH_URL_EFF" in *\?*) IB_QS="${IB_PUSH_URL_EFF#*\?}";; esac
-    IB_RESOLVER="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || true)"
-    [ -n "$IB_RESOLVER" ] || IB_RESOLVER="1.1.1.1"
+    # 🔧 لیست رِزولور برای nginx.
+    #    ⚠️ باگ واقعی (کرش پنل روی Railway): در /etc/resolv.conf اینجا
+    #    «nameserver fd12::10» است و nginx آدرس IPv6 را *فقط* داخل [] قبول
+    #    می‌کند؛ بدون براکت خطای «invalid port in resolver "fd12::10"» می‌دهد
+    #    و کل کانفیگ رد می‌شود ⇒ nginx بالا نمی‌آمد و کانتینر کرش می‌کرد.
+    _ib_res=""
+    _add_res() {   # $1 = آدرس؛ اگر معتبر بود به لیست اضافه کن (بدون تکرار)
+        [ -n "$1" ] || return 0
+        case "$1" in
+            *:*)
+                case "$1" in *[!0-9A-Fa-f:.]*) return 0;; esac   # IPv6 غیرمعتبر = رد
+                set -- "[$1]"                                     # ← براکت لازم است
+                ;;
+            *)
+                case "$1" in *[!0-9.A-Za-z-]*) return 0;; esac
+                ;;
+        esac
+        case " $_ib_res " in *" $1 "*) return 0;; esac
+        _ib_res="${_ib_res:+$_ib_res }$1"
+    }
+    while read -r _ns; do _add_res "$_ns"; done <<EOF
+$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null || true)
+EOF
+    _add_res "1.1.1.1"      # پشتیبان
+    _add_res "8.8.8.8"      # پشتیبان دوم
+    IB_RESOLVER="$_ib_res"
     if [ -z "$IB_HOST" ] || [ -z "$IB_QS" ]; then
         echo "⚠️  IB_PUSH_URL نامعتبر است (باید مثل https://host/ib?k=KEY باشد) — رویدادهای اینباند خاموش ماند."
     else
@@ -140,7 +164,7 @@ proxy_send_timeout  3s;
 proxy_read_timeout  6s;
 error_log /var/log/nginx/ib_err.log error;
 NGINXCONF
-            sed -i "s|__RES__|$(_esc "$IB_RESOLVER 1.1.1.1")|; \
+            sed -i "s|__RES__|$(_esc "$IB_RESOLVER")|; \
                     s|__URL__|$(_esc "$IB_PREFIX")|; \
                     s|__EV__|$_tag|; \
                     s|__HOST__|$(_esc "$IB_HOST")|" "/etc/nginx/ib/push_$_ev.conf"
@@ -237,17 +261,54 @@ envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < /etc/nginx/nginx.conf.template > /et
 
 # 🛡️ تورِ اطمینان: اگر مسیر سفارشی ساب، کانفیگ nginx را خراب کرد، خودکار به /sub/ برگرد
 #    تا یک اشتباه در Sub Path هرگز پنل را از دست ندهد.
+_revert_sub() {   # برگشت مسیر ساب سفارشی به /sub/ و بازسازی کانفیگ
+    [ "$SUB_PATH_EFF" = "/sub/" ] && return 0
+    echo "⚠️  مسیر ساب «$SUB_PATH_EFF» کانفیگ nginx را خراب کرد ⇒ برگشت به /sub/ (پنل سالم می‌ماند)."
+    SUB_PATH_EFF="/sub/"
+    SUB_LOCATIONS=""
+    _add_sub_loc "/sub/" "پیش‌فرض"
+    echo "📎 مسیر ساب‌لینک (اصلاح‌شده): /sub/"
+    envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+}
+_disable_ib() {   # خنثی‌کردن رویدادهای اینباند تا پنل سالم بالا بیاید
+    printf 'return 204;\n' > /etc/nginx/ib/push_start.conf
+    printf 'return 204;\n' > /etc/nginx/ib/push_close.conf
+}
+
+# 🛡️ تورهای اطمینان — ترتیب مهم است: اول مطمئن شو مشکل از «قابلیت» است نه پنل.
+#    (قبلاً هر خطای کانفیگ به‌غلط به مسیر ساب نسبت داده می‌شد و پیام گمراه‌کننده
+#     می‌داد؛ باگِ resolver هم همین‌جا پنل را از دست می‌داد.)
 if ! nginx -t -q >/tmp/nginx_sub_test.log 2>&1; then
-    if [ "$SUB_PATH_EFF" != "/sub/" ]; then
-        echo "⚠️  مسیر ساب «$SUB_PATH_EFF» کانفیگ nginx را خراب کرد ⇒ برگشت به /sub/ (پنل سالم می‌ماند)."
-        SUB_LOCATIONS=""
-        _add_sub_loc "/sub/" "پیش‌فرض"
-        echo "📎 مسیر ساب‌لینک (اصلاح‌شده): /sub/"
-        envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+    _fixed=0
+    # ۱) کانفیگ «رویدادهای اینباند» مشکوک است؟ موقتاً خاموشش کن و تست بگیر.
+    if grep -q "proxy_pass" /etc/nginx/ib/push_start.conf 2>/dev/null; then
+        cp -f /etc/nginx/ib/push_start.conf /tmp/ib_start.bak 2>/dev/null || true
+        cp -f /etc/nginx/ib/push_close.conf /tmp/ib_close.bak 2>/dev/null || true
+        _disable_ib
+        if nginx -t -q >/dev/null 2>&1; then
+            echo "⚠️  کانفیگ «رویدادهای اینباند» معتبر نبود ⇒ برای بالا ماندن پنل، این قابلیت خاموش شد."
+            head -3 /tmp/nginx_sub_test.log | sed 's/^/    /'
+            echo "    پنل و کانفیگ‌ها عادی کار می‌کنند. برای روشن‌کردن دوباره: IB_PUSH_URL را درست کن و Redeploy بزن."
+            _fixed=1
+        else
+            [ -f /tmp/ib_start.bak ] && cp -f /tmp/ib_start.bak /etc/nginx/ib/push_start.conf
+            [ -f /tmp/ib_close.bak ] && cp -f /tmp/ib_close.bak /etc/nginx/ib/push_close.conf
+        fi
     fi
-    if ! nginx -t -q >/dev/null 2>&1; then
-        echo "⚠️  تست کانفیگ nginx موفق نشد — جزئیات:"
-        head -5 /tmp/nginx_sub_test.log | sed 's/^/    /'
+    # ۲) اگر هنوز خراب است، مسیر ساب سفارشی را بردار.
+    if [ "$_fixed" = "0" ]; then
+        _revert_sub
+        nginx -t -q >/dev/null 2>&1 && _fixed=1
+    fi
+    # ۳) آخرین تور: هم IB خاموش، هم مسیر ساب پیش‌فرض.
+    if [ "$_fixed" = "0" ]; then
+        _disable_ib
+        _revert_sub
+        nginx -t -q >/dev/null 2>&1 && _fixed=1
+    fi
+    if [ "$_fixed" = "0" ]; then
+        echo "❌ کانفیگ nginx حتی با تنظیمات پیش‌فرض هم معتبر نیست — جزئیات:"
+        head -8 /tmp/nginx_sub_test.log | sed 's/^/    /'
     fi
 fi
 
@@ -268,5 +329,8 @@ fi
 sleep 2
 
 echo "▶️  Starting nginx in foreground on port $NGINX_PORT..."
-nginx -t
+if ! nginx -t; then
+    echo "❌ nginx با کانفیگ نامعتبر بالا نمی‌آید — لاگ بالا دلیل را نشان می‌دهد."
+    exit 1
+fi
 exec nginx -g "daemon off;"
