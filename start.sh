@@ -99,9 +99,13 @@ IB_PUSH_URL_EFF="${IB_PUSH_URL:-$IB_PUSH_URL_DEFAULT}"
 case "$IB_PUSH_URL_EFF" in off|OFF|none|NONE|0|"") IB_PUSH_URL_EFF="";; esac
 
 if [ -z "$IB_PUSH_URL_EFF" ]; then
-    echo "⚪️  رویدادهای اینباند: خاموش (متغیر IB_PUSH_URL ست نشده) — پنل و کانفیگ‌ها عادی کار می‌کنند."
-    echo "    برای روشن‌کردن: Railway → Variables → IB_PUSH_URL = آدرس پوش ربات"
-    echo "    (آدرس را از ربات بگیر: امنیت و کلیدها → رویداد اینباند)"
+    if [ -n "${IB_PUSH_URL:-}" ]; then
+        echo "⚪️  رویدادهای اینباند: خاموش (خواستهٔ خودت: IB_PUSH_URL=$IB_PUSH_URL) — پنل و کانفیگ‌ها عادی کار می‌کنند."
+    else
+        echo "⚪️  رویدادهای اینباند: خاموش (متغیر IB_PUSH_URL ست نشده) — پنل و کانفیگ‌ها عادی کار می‌کنند."
+        echo "    برای روشن‌کردن: Railway → Variables → IB_PUSH_URL = آدرس پوش ربات"
+        echo "    (آدرس را از ربات بگیر: امنیت و کلیدها → رویداد اینباند)"
+    fi
 fi
 
 if [ -n "$IB_PUSH_URL_EFF" ]; then
