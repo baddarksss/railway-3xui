@@ -209,23 +209,51 @@ _norm_sub_path() {   # مثل خودِ پنل: با / شروع و با / تما�
     case "$_p" in */) ;; *) _p="$_p/";; esac
     printf '%s' "$_p"
 }
+# مسیرِ داخل یک URI (مثل Subscription URI): پنل اگر Subscription URI پر باشد،
+# مسیر ساب را از pathname همان می‌سازد (در فرانت‌اند پنل هم دقیقاً همین کار را می‌کند).
+_sub_uri_path() {
+    _u="$(printf '%s' "$1" | tr -d '\r\n')"
+    [ -n "$_u" ] || return 0
+    case "$_u" in
+        *://*) _r="${_u#*://}"; case "$_r" in */*) _u="/${_r#*/}";; *) _u="/";; esac;;
+        /*) ;;
+        *) _u="/$_u";;
+    esac
+    _u="${_u%%\?*}"; _u="${_u%%#*}"
+    [ "$_u" = "/" ] && return 0
+    _norm_sub_path "$_u"
+}
+
 SUB_LOCATIONS=""
 _add_sub_loc() {   # $1=مسیر  $2=برچسب
     case "$1" in ""|"/") return 0;; esac
+    # گارد: مسیرهای رزرو‌شده یا نامعتبر هرگز وارد کانفیگ نمی‌شوند
+    case "$1" in /managepanel*|/ib|/ib/*|/_ib*|/in[0-9]*) return 0;; esac
+    case "$1" in *[!A-Za-z0-9/_.-]*) return 0;; esac
+    [ "${#1}" -le 60 ] || return 0
     case "$SUB_LOCATIONS" in *"location $1 {"*) return 0;; esac   # ← ستارهٔ آخر لازم است: case تمام رشته را تطبیق می‌دهد
     if [ -n "$SUB_LOCATIONS" ]; then SUB_LOCATIONS="$SUB_LOCATIONS
 "; fi
-    SUB_LOCATIONS="${SUB_LOCATIONS}        # ساب‌لینک ($2) → سرور ساب روی پورت داخلی 2096
+    # ⚠️ متن کامنت عمداً ثابت است و برچسب مسیر ($2) داخلش نمی‌آید؛ چون نگهبانِ ساب
+    #    فایل کانفیگ را با cmp مقایسه می‌کند و فرقِ کامنت باعث ریلود بی‌مورد می‌شد.
+    SUB_LOCATIONS="${SUB_LOCATIONS}        # ساب‌لینک → سرور ساب روی پورت داخلی ${SUB_UPSTREAM_PORT}
         location ${1} {
-            proxy_pass http://127.0.0.1:2096${1};
+            proxy_pass http://127.0.0.1:${SUB_UPSTREAM_PORT}${1};
             proxy_http_version 1.1;
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$client_real_ip;
             proxy_set_header X-Forwarded-For \$client_real_ip;
             proxy_set_header X-Forwarded-Proto \$scheme;
         }"
+    SUB_PATHS_SERVED="$SUB_PATHS_SERVED $1"   # فقط برای لاگ
     return 0
 }
+SUB_PATHS_SERVED=""
+# پورت داخلی سرور ساب — از تنظیمات خود پنل (پیش‌فرض 2096). اگر پنل را عوض کنید،
+# نگهبان ساب (sub-path-watch.sh) خودکار nginx را بازسازی می‌کند.
+SUB_UPSTREAM_PORT="$(_sqlset subPort)"
+case "$SUB_UPSTREAM_PORT" in ''|*[!0-9]*) SUB_UPSTREAM_PORT=2096;; esac
+
 SUB_PATH_EFF="$(_norm_sub_path "${SUB_PATH:-$(_sqlset subPath)}")"
 [ -n "$SUB_PATH_EFF" ] || SUB_PATH_EFF="/sub/"
 _ok_sub=1
@@ -240,17 +268,32 @@ if [ "$_ok_sub" = "0" ]; then
     echo "⚠️  مسیر ساب «$SUB_PATH_EFF» قابل استفاده نیست (هم‌پوشانی با مسیرهای رزرو یا کاراکتر غیرمجاز) ⇒ روی /sub/ برگشتیم."
     SUB_PATH_EFF="/sub/"
 fi
+# سرور ساب پنل ممکن است روی یکی از این مسیرها بالا بیاید؛ برای اینکه ساب‌لینک در هیچ
+# حالتی ۴۰۴ نشود، هر سه نامزد سرو می‌شوند: مسیرِ Subscription URI، Subscription Path و
+# مسیر پیش‌فرض /sub/. (مسیرهای تکراری/رزرو‌شده خودکار حذف می‌شوند.)
+# اگر ساب در پنل خاموش باشد (subEnable=false) هیچ مسیری سرو نمی‌شود.
+if [ "$(_sqlset subEnable)" = "false" ]; then
+    echo "ℹ️  ساب‌لینک در پنل خاموش است (subEnable=false) ⇒ هیچ مسیر سابی سرو نمی‌شود."
+else
+_add_sub_loc "$(_sub_uri_path "$(_sqlset subURI)")" "URI"
 _add_sub_loc "$SUB_PATH_EFF" "اصلی"
+_add_sub_loc "/sub/" "پیش‌فرض"
 if [ "$(_sqlset subJsonEnable)" = "true" ]; then
+    _add_sub_loc "$(_sub_uri_path "$(_sqlset subJsonURI)")" "JSON-URI"
     _add_sub_loc "$(_norm_sub_path "${SUB_JSON_PATH:-$(_sqlset subJsonPath)}")" "JSON"
+    _add_sub_loc "/json/" "JSON-پیش‌فرض"
 fi
 if [ "$(_sqlset subClashEnable)" = "true" ]; then
+    _add_sub_loc "$(_sub_uri_path "$(_sqlset subClashURI)")" "Clash-URI"
     _add_sub_loc "$(_norm_sub_path "${SUB_CLASH_PATH:-$(_sqlset subClashPath)}")" "Clash"
+    _add_sub_loc "/clash/" "Clash-پیش‌فرض"
+fi
 fi
 # ⚠️ این متغیر را باید export کنیم؛ envsubst فقط متغیرهای محیطی را می‌بیند.
 export SUB_LOCATIONS
 
-echo "📎 مسیر ساب‌لینک: $SUB_PATH_EFF"
+echo "📎 مسیر ساب‌لینک: $SUB_PATH_EFF (پورت داخلی سرور ساب: $SUB_UPSTREAM_PORT)"
+echo "📎 مسیرهایی که برای ساب سرو می‌شوند:${SUB_PATHS_SERVED:- (هیچ — ساب خاموش است)}"
 _subdom="$(_sqlset subDomain)"
 if [ -n "$_subdom" ]; then
     echo "ℹ️  Sub Domain پنل روی «$_subdom» است ⇒ سرور ساب فقط با همین دامنه جواب می‌دهد."
@@ -319,30 +362,44 @@ fi
 #    پیش‌فرض‌ها روی Railway غلط‌اند: SubPort=2096 و بدون سرتیفیکیت ⇒ http
 #    یعنی لینکی مثل http://domain:2096/... که از بیرون باز نمی‌شود.
 _PUB="$(printf '%s' "${RAILWAY_PUBLIC_DOMAIN:-${RAILWAY_STATIC_URL:-}}" | sed 's|^https\?://||; s|/.*$||')"
-_SUB_EFF="$(_sqlset subPath)"; [ -n "$_SUB_EFF" ] || _SUB_EFF="/sub/"
 _SUB_URI_DB="$(_sqlset subURI)"
+_SUBPORT_DB="$(_sqlset subPort)"; [ -n "$_SUBPORT_DB" ] || _SUBPORT_DB=2096
+_SUBDOM_DB="$(_sqlset subDomain)"
 if [ -n "$_PUB" ]; then
-    echo "📎 آدرس درست ساب روی این دامنه: https://${_PUB}${_SUB_EFF}<subId>"
+    echo "📎 آدرس درست ساب روی این دامنه: https://${_PUB}${SUB_PATH_EFF}<subId>"
 fi
+# همان آدرسی که پنل الان به کاربر نشان می‌دهد (بازسازی قانون BuildSubURIBase)
+if [ -n "$_SUB_URI_DB" ]; then
+    _ADV="$_SUB_URI_DB"
+else
+    _adv_host="${_SUBDOM_DB:-${_PUB:-دامنه}}"
+    _omit_port=0
+    if [ "$_SUBPORT_DB" = "443" ] && [ -n "$(_sqlset subCertFile)" ] && [ -n "$(_sqlset subKeyFile)" ]; then _omit_port=1; fi
+    if [ "$_SUBPORT_DB" = "80" ] && [ -z "$(_sqlset subCertFile)" ]; then _omit_port=1; fi
+    _adv_scheme=http
+    [ -n "$(_sqlset subCertFile)" ] && _adv_scheme=https
+    if [ "$_omit_port" = "1" ]; then
+        _ADV="${_adv_scheme}://${_adv_host}${SUB_PATH_EFF}"
+    else
+        _ADV="${_adv_scheme}://${_adv_host}:${_SUBPORT_DB}${SUB_PATH_EFF}"
+    fi
+fi
+echo "ℹ️  آدرسی که پنل الان به کاربر نشان می‌دهد: ${_ADV}<subId>  (SubPort=$_SUBPORT_DB | SubDomain=${_SUBDOM_DB:-خالی} | SubPath=$(_sqlset subPath))"
 if [ -z "$_PUB" ]; then
     echo "ℹ️  برای دیدن آدرس درست ساب: Railway → Settings → Networking → Generate Domain"
 fi
-case "$_SUB_URI_DB" in
-    "")
-        echo "⚠️  در پنل، «Subscription URI» خالی است ⇒ پنل خودش لینک می‌سازد و با پیش‌فرض‌های"
-        echo "    SubPort=2096 آن لینک از بیرون باز نمی‌شود. برای درست‌شدن لینک‌ها:"
-        echo "    پنل → Settings → Subscription → Sub Port = 443"
-        echo "                                   Subscription URI = https://${_PUB:-دامنهٔ-خودت}${_SUB_EFF}"
+case "$_ADV" in
+    https://*)
+        # آدرس درست است (روی https و بدون پورت داخلی) — فقط اگر پورت داخلی داخلش باشد هشدار بده
+        case "$_ADV" in *:2096/*) echo "⚠️  پورت 2096 داخل آدرس ساب است ⇒ همان لینک نادرست است. Subscription URI را روی https://${_PUB:-دامنه}${SUB_PATH_EFF} بگذارید.";; esac
         ;;
-    *:2096*|http://*)
-        echo "⚠️  «Subscription URI» فعلی پنل («$_SUB_URI_DB») از بیرون باز نمی‌شود."
-        echo "    درستش: پنل → Settings → Subscription → Subscription URI = https://${_PUB:-دامنهٔ-خودت}${_SUB_EFF}"
+    *)
+        echo "⚠️  آدرس ساب فعلی («${_ADV}…») از بیرون باز نمی‌شود؛ چون Railway فقط https روی دامنه را"
+        echo "    به بیرون می‌دهد (نه پورت داخلی). یک بار در پنل این را ست کنید:"
+        echo "    پنل → Settings → Subscription → Subscription URI = https://${_PUB:-دامنهٔ-خودت}${SUB_PATH_EFF}"
+        echo "    (SubDomain خالی بماند؛ SubPort و SubPath را لازم نیست عوض کنید — nginx هر دو مسیر را سرو می‌کند)"
         ;;
 esac
-if [ -n "$_subdom" ]; then
-    echo "⚠️  «Sub Domain» در پنل روی «$_subdom» است ⇒ سرور ساب فقط با همین دامنه جواب می‌دهد."
-    echo "    اگر با دامنهٔ دیگری ساب می‌گیری، این فیلد را خالی کن."
-fi
 echo "▶️  Starting x-ui in background..."
 ./x-ui &
 X_UI_PID=$!
