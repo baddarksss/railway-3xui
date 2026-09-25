@@ -170,10 +170,13 @@ echo "🔧 Building nginx.conf for fixed port: $NGINX_PORT"
 #     (بعد از تغییر، یک بار Redeploy بزنید تا nginx با مسیر جدید بالا بیاید)
 #   • override دستی: متغیر SUB_PATH=/my-path/
 XUI_DB_FILE="${XUI_DB_FOLDER:-/etc/x-ui}/x-ui.db"
-_sqlset() {
+_sqlset() {   # خواندن یک تنظیم از دیتابیس پنل (اول read-only، اگر نشد عادی)
     [ -f "$XUI_DB_FILE" ] || return 0
     command -v sqlite3 >/dev/null 2>&1 || return 0
-    sqlite3 -noheader "file:${XUI_DB_FILE}?mode=ro" "select value from settings where key='$1' limit 1;" 2>/dev/null | tr -d '\r\n' || true
+    _q="select value from settings where key='$1' limit 1;"
+    _v="$(sqlite3 -noheader -readonly "file:${XUI_DB_FILE}?mode=ro" "$_q" 2>/dev/null | tr -d '\r\n')"
+    [ -n "$_v" ] || _v="$(sqlite3 -noheader "$XUI_DB_FILE" "$_q" 2>/dev/null | tr -d '\r\n')"
+    printf '%s' "$_v"
 }
 _norm_sub_path() {   # مثل خودِ پنل: با / شروع و با / تمام شود
     _p="$(printf '%s' "$1" | tr -d '\r\n')"   # فاصله/کاراکتر غیرمجاز = نامعتبر
