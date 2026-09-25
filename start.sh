@@ -248,49 +248,105 @@ _add_sub_loc() {   # $1=مسیر  $2=برچسب
     SUB_PATHS_SERVED="$SUB_PATHS_SERVED $1"   # فقط برای لاگ
     return 0
 }
-SUB_PATHS_SERVED=""
-# پورت داخلی سرور ساب — از تنظیمات خود پنل (پیش‌فرض 2096). اگر پنل را عوض کنید،
-# نگهبان ساب (sub-path-watch.sh) خودکار nginx را بازسازی می‌کند.
-SUB_UPSTREAM_PORT="$(_sqlset subPort)"
-case "$SUB_UPSTREAM_PORT" in ''|*[!0-9]*) SUB_UPSTREAM_PORT=2096;; esac
+# ══════════════════════════════════════════════════════════════════════════
+#  ساخت بخش سابِ کانفیگ nginx — یک تابع مشترک
+#  هم هنگام بوت و هم نگهبانِ ساب (حلقهٔ زیر) از همین تابع استفاده می‌کنند تا
+#  کانفیگ هر دو مسیر دقیقاً یکی باشد و ریلودِ بی‌مورد رخ ندهد.
+#  $1 = "1" یعنی بی‌صدا (حلقهٔ نگهبان هر ۱۵ ثانیه لاگ اسپم نکند)
+# ══════════════════════════════════════════════════════════════════════════
+_build_sub_config() {
+    _quiet="${1:-0}"
+    SUB_LOCATIONS=""
+    SUB_PATHS_SERVED=""
 
-SUB_PATH_EFF="$(_norm_sub_path "${SUB_PATH:-$(_sqlset subPath)}")"
-[ -n "$SUB_PATH_EFF" ] || SUB_PATH_EFF="/sub/"
-_ok_sub=1
-case "$SUB_PATH_EFF" in
-    /) _ok_sub=0;;
-    /managepanel*|/ib|/ib/*|/_ib*) _ok_sub=0;;
-    /in[0-9]*) _ok_sub=0;;
-    *[!A-Za-z0-9/_.-]*) _ok_sub=0;;
-esac
-[ "${#SUB_PATH_EFF}" -le 60 ] || _ok_sub=0
-if [ "$_ok_sub" = "0" ]; then
-    echo "⚠️  مسیر ساب «$SUB_PATH_EFF» قابل استفاده نیست (هم‌پوشانی با مسیرهای رزرو یا کاراکتر غیرمجاز) ⇒ روی /sub/ برگشتیم."
-    SUB_PATH_EFF="/sub/"
-fi
-# سرور ساب پنل ممکن است روی یکی از این مسیرها بالا بیاید؛ برای اینکه ساب‌لینک در هیچ
-# حالتی ۴۰۴ نشود، هر سه نامزد سرو می‌شوند: مسیرِ Subscription URI، Subscription Path و
-# مسیر پیش‌فرض /sub/. (مسیرهای تکراری/رزرو‌شده خودکار حذف می‌شوند.)
-# اگر ساب در پنل خاموش باشد (subEnable=false) هیچ مسیری سرو نمی‌شود.
-if [ "$(_sqlset subEnable)" = "false" ]; then
-    echo "ℹ️  ساب‌لینک در پنل خاموش است (subEnable=false) ⇒ هیچ مسیر سابی سرو نمی‌شود."
-else
-_add_sub_loc "$(_sub_uri_path "$(_sqlset subURI)")" "URI"
-_add_sub_loc "$SUB_PATH_EFF" "اصلی"
-_add_sub_loc "/sub/" "پیش‌فرض"
-if [ "$(_sqlset subJsonEnable)" = "true" ]; then
-    _add_sub_loc "$(_sub_uri_path "$(_sqlset subJsonURI)")" "JSON-URI"
-    _add_sub_loc "$(_norm_sub_path "${SUB_JSON_PATH:-$(_sqlset subJsonPath)}")" "JSON"
-    _add_sub_loc "/json/" "JSON-پیش‌فرض"
-fi
-if [ "$(_sqlset subClashEnable)" = "true" ]; then
-    _add_sub_loc "$(_sub_uri_path "$(_sqlset subClashURI)")" "Clash-URI"
-    _add_sub_loc "$(_norm_sub_path "${SUB_CLASH_PATH:-$(_sqlset subClashPath)}")" "Clash"
-    _add_sub_loc "/clash/" "Clash-پیش‌فرض"
-fi
-fi
-# ⚠️ این متغیر را باید export کنیم؛ envsubst فقط متغیرهای محیطی را می‌بیند.
-export SUB_LOCATIONS
+    # پورت داخلی سرور ساب — از تنظیمات خود پنل (پیش‌فرض 2096)
+    SUB_UPSTREAM_PORT="$(_sqlset subPort)"
+    case "$SUB_UPSTREAM_PORT" in ''|*[!0-9]*) SUB_UPSTREAM_PORT=2096;; esac
+
+    SUB_PATH_EFF="$(_norm_sub_path "${SUB_PATH:-$(_sqlset subPath)}")"
+    [ -n "$SUB_PATH_EFF" ] || SUB_PATH_EFF="/sub/"
+    _ok_sub=1
+    case "$SUB_PATH_EFF" in
+        /) _ok_sub=0;;
+        /managepanel*|/ib|/ib/*|/_ib*) _ok_sub=0;;
+        /in[0-9]*) _ok_sub=0;;
+        *[!A-Za-z0-9/_.-]*) _ok_sub=0;;
+    esac
+    [ "${#SUB_PATH_EFF}" -le 60 ] || _ok_sub=0
+    if [ "$_ok_sub" = "0" ]; then
+        [ "$_quiet" = "0" ] && echo "⚠️  مسیر ساب «$SUB_PATH_EFF» قابل استفاده نیست (هم‌پوشانی با مسیرهای رزرو یا کاراکتر غیرمجاز) ⇒ روی /sub/ برگشتیم."
+        SUB_PATH_EFF="/sub/"
+    fi
+
+    # سرور ساب پنل ممکن است روی یکی از این مسیرها بالا بیاید؛ برای اینکه ساب‌لینک در هیچ
+    # حالتی ۴۰۴ نشود، هر سه نامزد سرو می‌شوند: مسیرِ Subscription URI، Subscription Path و
+    # مسیر پیش‌فرض /sub/. (مسیرهای تکراری/رزرو‌شده خودکار حذف می‌شوند.)
+    # اگر ساب در پنل خاموش باشد (subEnable=false) هیچ مسیری سرو نمی‌شود.
+    if [ "$(_sqlset subEnable)" = "false" ]; then
+        [ "$_quiet" = "0" ] && echo "ℹ️  ساب‌لینک در پنل خاموش است (subEnable=false) ⇒ هیچ مسیر سابی سرو نمی‌شود."
+    else
+        _add_sub_loc "$(_sub_uri_path "$(_sqlset subURI)")" "URI"
+        _add_sub_loc "$SUB_PATH_EFF" "اصلی"
+        _add_sub_loc "/sub/" "پیش‌فرض"
+        if [ "$(_sqlset subJsonEnable)" = "true" ]; then
+            _add_sub_loc "$(_sub_uri_path "$(_sqlset subJsonURI)")" "JSON-URI"
+            _add_sub_loc "$(_norm_sub_path "${SUB_JSON_PATH:-$(_sqlset subJsonPath)}")" "JSON"
+            _add_sub_loc "/json/" "JSON-پیش‌فرض"
+        fi
+        if [ "$(_sqlset subClashEnable)" = "true" ]; then
+            _add_sub_loc "$(_sub_uri_path "$(_sqlset subClashURI)")" "Clash-URI"
+            _add_sub_loc "$(_norm_sub_path "${SUB_CLASH_PATH:-$(_sqlset subClashPath)}")" "Clash"
+            _add_sub_loc "/clash/" "Clash-پیش‌فرض"
+        fi
+    fi
+}
+
+# ساخت کل کانفیگ nginx   $1 = فایل خروجی   $2 = "1" بی‌صدا
+_gen_nginx_conf() {
+    _build_sub_config "${2:-0}"
+    # ⚠️ این متغیر را باید export کنیم؛ envsubst فقط متغیرهای محیطی را می‌بیند.
+    export SUB_LOCATIONS
+    envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < /etc/nginx/nginx.conf.template > "$1"
+}
+
+# ── نگهبان مسیر ساب ──────────────────────────────────────────────────────────
+#   سرور ساب پنل هر بار که تنظیمات ذخیره شود با مسیر جدید بالا می‌آید، ولی nginx
+#   فقط هنگام بوت مسیر را می‌خواند. این حلقه هر چند ثانیه کانفیگ را از تنظیمات
+#   فعلی پنل بازمی‌سازد و اگر فرق داشت، تست و ریلود می‌کند — بدون Redeploy.
+#   اگر کانفیگ جدید معتبر نباشد، اعمال نمی‌شود (پنل هرگز از دست نمی‌رود).
+_sub_watch_loop() {
+    _interval="${SUB_WATCH_INTERVAL:-15}"
+    _fails=0
+    while true; do
+        if _gen_nginx_conf /etc/nginx/nginx.conf.new 1; then
+            if cmp -s /etc/nginx/nginx.conf.new /etc/nginx/nginx.conf; then
+                rm -f /etc/nginx/nginx.conf.new
+                _fails=0
+            elif ! nginx -t -c /etc/nginx/nginx.conf.new >/tmp/sub_watch_test.log 2>&1; then
+                echo "⚠️  نگهبان ساب: کانفیگ جدید معتبر نیست — کانفیگ فعلی دست‌نخورده ماند."
+                head -3 /tmp/sub_watch_test.log 2>/dev/null | sed 's/^/    /'
+                rm -f /etc/nginx/nginx.conf.new
+                _fails=$((_fails+1)); [ "$_fails" -gt 5 ] && _fails=5
+            else
+                mv -f /etc/nginx/nginx.conf.new /etc/nginx/nginx.conf
+                if nginx -s reload 2>/tmp/sub_watch_reload.log; then
+                    echo "🔁 تنظیمات ساب در پنل عوض شد ⇒ nginx بازسازی و ریلود شد — مسیرها:${SUB_PATHS_SERVED:- (هیچ — ساب خاموش است)} (پورت داخلی: ${SUB_UPSTREAM_PORT})"
+                    _fails=0
+                else
+                    echo "⚠️  نگهبان ساب: ریلود nginx ناموفق بود:"
+                    head -3 /tmp/sub_watch_reload.log 2>/dev/null | sed 's/^/    /'
+                    _fails=$((_fails+1)); [ "$_fails" -gt 5 ] && _fails=5
+                fi
+            fi
+        else
+            _fails=$((_fails+1)); [ "$_fails" -gt 5 ] && _fails=5
+        fi
+        if [ "$_fails" -gt 0 ]; then sleep 60; else sleep "$_interval"; fi
+    done
+}
+
+# ── ساخت کانفیگ هنگام بوت + لاگ وضعیت ساب ──
+_gen_nginx_conf /etc/nginx/nginx.conf 0
 
 echo "📎 مسیر ساب‌لینک: $SUB_PATH_EFF (پورت داخلی سرور ساب: $SUB_UPSTREAM_PORT)"
 echo "📎 مسیرهایی که برای ساب سرو می‌شوند:${SUB_PATHS_SERVED:- (هیچ — ساب خاموش است)}"
@@ -300,7 +356,7 @@ if [ -n "$_subdom" ]; then
     echo "    اگر ساب‌لینک باز نمی‌شود، این فیلد را در پنل خالی کنید."
 fi
 
-envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+
 
 # 🛡️ تورِ اطمینان: اگر مسیر سفارشی ساب، کانفیگ nginx را خراب کرد، خودکار به /sub/ برگرد
 #    تا یک اشتباه در Sub Path هرگز پنل را از دست ندهد.
@@ -415,8 +471,8 @@ if [ "${XUI_AUTO_SOCKOPT:-true}" = "true" ]; then
 fi
 
 # نگهبان مسیر ساب: اگر مسیر ساب در پنل عوض شود، nginx را بدون Redeploy ریلود می‌کند
-if [ "${XUI_SUB_WATCH:-true}" = "true" ] && [ -x /sub-path-watch.sh ]; then
-    /sub-path-watch.sh &
+if [ "${XUI_SUB_WATCH:-true}" = "true" ]; then
+    _sub_watch_loop &
 fi
 
 sleep 2
