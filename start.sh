@@ -163,7 +163,90 @@ NGINXCONF
 fi
 
 echo "🔧 Building nginx.conf for fixed port: $NGINX_PORT"
-envsubst '${NGINX_PORT}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+# ─── مسیر ساب‌سکرایب: از تنظیمات خودِ پنل خوانده می‌شود ───
+# پیش‌فرض پنل /sub/ است، ولی Sub Path می‌تواند هر مسیری باشد (حتی رندوم).
+# در هر بالا آمدن سرویس، مسیر فعلی پنل خوانده و به nginx داده می‌شود.
+#   • تغییر مسیر: پنل → Settings → Subscription → Subscription Path
+#     (بعد از تغییر، یک بار Redeploy بزنید تا nginx با مسیر جدید بالا بیاید)
+#   • override دستی: متغیر SUB_PATH=/my-path/
+XUI_DB_FILE="${XUI_DB_FOLDER:-/etc/x-ui}/x-ui.db"
+_sqlset() {
+    [ -f "$XUI_DB_FILE" ] || return 0
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    sqlite3 -noheader "file:${XUI_DB_FILE}?mode=ro" "select value from settings where key='$1' limit 1;" 2>/dev/null | tr -d '\r\n' || true
+}
+_norm_sub_path() {   # مثل خودِ پنل: با / شروع و با / تمام شود
+    _p="$(printf '%s' "$1" | tr -d '\r\n')"   # فاصله/کاراکتر غیرمجاز = نامعتبر
+    [ -n "$_p" ] || return 0
+    case "$_p" in /*) ;; *) _p="/$_p";; esac
+    case "$_p" in */) ;; *) _p="$_p/";; esac
+    printf '%s' "$_p"
+}
+SUB_LOCATIONS=""
+_add_sub_loc() {   # $1=مسیر  $2=برچسب
+    case "$1" in ""|"/") return 0;; esac
+    case "$SUB_LOCATIONS" in *"location $1 {"*) return 0;; esac   # ← ستارهٔ آخر لازم است: case تمام رشته را تطبیق می‌دهد
+    if [ -n "$SUB_LOCATIONS" ]; then SUB_LOCATIONS="$SUB_LOCATIONS
+"; fi
+    SUB_LOCATIONS="${SUB_LOCATIONS}        # ساب‌لینک ($2) → سرور ساب روی پورت داخلی 2096
+        location ${1} {
+            proxy_pass http://127.0.0.1:2096${1};
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$client_real_ip;
+            proxy_set_header X-Forwarded-For \$client_real_ip;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }"
+    return 0
+}
+SUB_PATH_EFF="$(_norm_sub_path "${SUB_PATH:-$(_sqlset subPath)}")"
+[ -n "$SUB_PATH_EFF" ] || SUB_PATH_EFF="/sub/"
+_ok_sub=1
+case "$SUB_PATH_EFF" in
+    /) _ok_sub=0;;
+    /managepanel*|/ib|/ib/*|/_ib*) _ok_sub=0;;
+    /in[0-9]*) _ok_sub=0;;
+    *[!A-Za-z0-9/_.-]*) _ok_sub=0;;
+esac
+[ "${#SUB_PATH_EFF}" -le 60 ] || _ok_sub=0
+if [ "$_ok_sub" = "0" ]; then
+    echo "⚠️  مسیر ساب «$SUB_PATH_EFF» قابل استفاده نیست (هم‌پوشانی با مسیرهای رزرو یا کاراکتر غیرمجاز) ⇒ روی /sub/ برگشتیم."
+    SUB_PATH_EFF="/sub/"
+fi
+_add_sub_loc "$SUB_PATH_EFF" "اصلی"
+if [ "$(_sqlset subJsonEnable)" = "true" ]; then
+    _add_sub_loc "$(_norm_sub_path "${SUB_JSON_PATH:-$(_sqlset subJsonPath)}")" "JSON"
+fi
+if [ "$(_sqlset subClashEnable)" = "true" ]; then
+    _add_sub_loc "$(_norm_sub_path "${SUB_CLASH_PATH:-$(_sqlset subClashPath)}")" "Clash"
+fi
+# ⚠️ این متغیر را باید export کنیم؛ envsubst فقط متغیرهای محیطی را می‌بیند.
+export SUB_LOCATIONS
+
+echo "📎 مسیر ساب‌لینک: $SUB_PATH_EFF"
+_subdom="$(_sqlset subDomain)"
+if [ -n "$_subdom" ]; then
+    echo "ℹ️  Sub Domain پنل روی «$_subdom» است ⇒ سرور ساب فقط با همین دامنه جواب می‌دهد."
+    echo "    اگر ساب‌لینک باز نمی‌شود، این فیلد را در پنل خالی کنید."
+fi
+
+envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+
+# 🛡️ تورِ اطمینان: اگر مسیر سفارشی ساب، کانفیگ nginx را خراب کرد، خودکار به /sub/ برگرد
+#    تا یک اشتباه در Sub Path هرگز پنل را از دست ندهد.
+if ! nginx -t -q >/tmp/nginx_sub_test.log 2>&1; then
+    if [ "$SUB_PATH_EFF" != "/sub/" ]; then
+        echo "⚠️  مسیر ساب «$SUB_PATH_EFF» کانفیگ nginx را خراب کرد ⇒ برگشت به /sub/ (پنل سالم می‌ماند)."
+        SUB_LOCATIONS=""
+        _add_sub_loc "/sub/" "پیش‌فرض"
+        echo "📎 مسیر ساب‌لینک (اصلاح‌شده): /sub/"
+        envsubst '${NGINX_PORT} ${SUB_LOCATIONS}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+    fi
+    if ! nginx -t -q >/dev/null 2>&1; then
+        echo "⚠️  تست کانفیگ nginx موفق نشد — جزئیات:"
+        head -5 /tmp/nginx_sub_test.log | sed 's/^/    /'
+    fi
+fi
 
 echo "▶️  Starting x-ui in background..."
 ./x-ui &
