@@ -1,0 +1,255 @@
+worker_processes 1;
+events { worker_connections 1024; }
+
+http {
+    # تایم‌اوت‌های سراسری برای تونل WebSocket
+    # بدون این‌ها nginx بعد از ۶۰ ثانیه بی‌کاری اتصال را می‌بندد و کانفیگ قطع می‌شود
+    proxy_connect_timeout 60s;
+    proxy_send_timeout    3600s;
+    proxy_read_timeout    3600s;
+
+    # map برای مدیریت درست هدر Connection
+    # اگر درخواست WebSocket نبود، "upgrade" فرستادن اشتباه است
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    # --- تعیین IP واقعی کاربر ---
+    # Xray فقط «اولین» آی‌پی داخل هدر X-Forwarded-For را می‌خواند. زنجیره‌ای که
+    # به nginx می‌رسد چند آی‌پی دارد (لبه‌ی Railway، کلادفلر، کاربر) و ترتیبش هم
+    # بسته به مسیر فرق می‌کند. پس هدر را بازنویسی می‌کنیم تا فقط یک آی‌پی -
+    # خود کاربر - داخلش باشد.
+    #
+    # روی دامنه‌ی کاستوم کلادفلر جلوی درخواست است و آی‌پی واقعی را در هدر
+    # CF-Connecting-IP می‌گذارد. برای دامنه‌ی مستقیم railway.app، اولین آی‌پی
+    # زنجیره همان کاربر است.
+    map $http_x_forwarded_for $xff_first_ip {
+        "~^(?<first_ip>[^,[:space:]]+)"  $first_ip;
+        default                          "";
+    }
+
+    map $http_cf_connecting_ip $client_real_ip {
+        default  $http_cf_connecting_ip;
+        ""       $xff_first_ip;
+    }
+
+    # --- رویدادهای اینباند (برای ربات) ---
+    # در لحظهٔ باز شدن هر تونل، nginx یک نسخهٔ داخلی از درخواست را به مقصد
+    # /_ibstart می‌فرستد (mirror) و در لحظهٔ بسته شدن هم به /_ibclose
+    # (post_action). به این ترتیب ربات می‌فهمد «کدام کاربر (با کدام IP) روی
+    # کدام اینباند وصل شده است».
+    #
+    # به‌صورت پیش‌فرض این دو مقصد هیچ کاری نمی‌کنند (return 204) و به بیرون
+    # هیچ ارسالی ندارند. فقط اگر متغیر محیطی IB_PUSH_URL را در Railway ست
+    # کرده باشید، start.sh آدرس ربات را در /etc/nginx/ib/*.conf می‌نویسد.
+    #
+    # مسیر بدون query — فضای Xray همیشه قبل از ؟ می‌آید.
+    map $request_uri $ib_path {
+        ~^(?<ibp>[^?]*)  $ibp;
+    }
+    # بدنهٔ درخواست را کپی نکن (فقط مسیر و IP لازم است)
+    mirror_request_body off;
+
+    server {
+        listen ${NGINX_PORT};
+
+        # --- مقصد داخلی رویدادهای اینباند (مخصوص ربات) ---
+        # این دو مسیر فقط داخلی‌اند: با mirror در لحظهٔ شروع اتصال و با
+        # post_action در لحظهٔ پایان اتصال صدا زده می‌شوند. start.sh محتوایشان
+        # را می‌نویسد: پیش‌فرض «return 204» (هیچ اتصالی به بیرون) و اگر
+        # IB_PUSH_URL ست شده باشد، پراکسی به اندپوینت ربات.
+        location = /_ibstart { include /etc/nginx/ib/push_start.conf; }
+        location = /_ibclose { include /etc/nginx/ib/push_close.conf; }
+
+        # ریدایرکت‌ها باید نسبی باشند (Location: /managepanel/).
+        # چون TLS را خود Railway ترمینیت می‌کند، nginx فکر می‌کند اتصال http است
+        # و آدرس مطلقِ خراب می‌سازد: http://دامنه:3000/managepanel/
+        # با این خط، مرورگر خودش آدرس را نسبت به https فعلی می‌سازد.
+        absolute_redirect off;
+
+        # === باز شدن پنل با خود دامنه ===
+        # آدرس دامنه را بدون هیچ مسیری باز کنید، خودکار به پنل می‌رود.
+        # چون ریدایرکت نسبی است (Location: /managepanel/)، هم روی دامنه‌ی
+        # railway.app کار می‌کند هم روی دامنه‌ی کاستوم.
+        # اگر درخواست WebSocket باشد (اینباندی با Path برابر "/")، دست‌نخورده
+        # به پورت 8080 می‌رود تا آن اینباند هم سالم بماند.
+        location = / {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            if ($http_upgrade = "") {
+                return 302 /managepanel/;
+            }
+            proxy_pass http://127.0.0.1:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /managepanel بدون اسلش آخر هم به پنل برود
+        location = /managepanel {
+            return 302 /managepanel/;
+        }
+
+        # مسیر پنل وب (فوروارد به پورت داخلی 2053 که x-ui روش گوش می‌ده)
+        location /managepanel/ {
+            proxy_pass http://127.0.0.1:2053/managepanel/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # مسیر Subscription (ساب لینک) - فوروارد به پورت داخلی 2096
+        location /sub/ {
+            proxy_pass http://127.0.0.1:2096/sub/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # هر مسیر دیگه (اینباند VLESS/WebSocket) به پورت داخلی 8080
+        location / {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # --- اینباندهای اضافی: هر مسیر به یک پورت داخلی ---
+        # /in1 -> 8081 ... /in9 -> 8089
+        # در پنل، پورت اینباند را همان عدد روبه‌روی مسیرش بگذارید و Network را ws انتخاب کنید
+
+        location /in1 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8081;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in2 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8082;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in3 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8083;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in4 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8084;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in5 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8085;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in6 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8086;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in7 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8087;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in8 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8088;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /in9 {
+            mirror /_ibstart;      # رویداد «شروع اتصال» → ربات
+            post_action /_ibclose; # رویداد «پایان اتصال» → ربات
+            proxy_pass http://127.0.0.1:8089;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $client_real_ip;
+            proxy_set_header X-Forwarded-For $client_real_ip;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}
