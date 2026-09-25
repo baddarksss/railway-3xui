@@ -312,6 +312,37 @@ if ! nginx -t -q >/tmp/nginx_sub_test.log 2>&1; then
     fi
 fi
 
+# ── راهنمای «آدرس درست ساب‌لینک» + هم‌گام‌سازی زندهٔ nginx ──────────────────
+# ⚠️ پنل آدرسی که به کاربر نشان می‌دهد را از این‌ها می‌سازد:
+#      Subscription URI   (اگر پر باشد، همین استفاده می‌شود)
+#      وگرنه:  (http|https)://SubDomain:SubPort + SubPath
+#    پیش‌فرض‌ها روی Railway غلط‌اند: SubPort=2096 و بدون سرتیفیکیت ⇒ http
+#    یعنی لینکی مثل http://domain:2096/... که از بیرون باز نمی‌شود.
+_PUB="$(printf '%s' "${RAILWAY_PUBLIC_DOMAIN:-${RAILWAY_STATIC_URL:-}}" | sed 's|^https\?://||; s|/.*$||')"
+_SUB_EFF="$(_sqlset subPath)"; [ -n "$_SUB_EFF" ] || _SUB_EFF="/sub/"
+_SUB_URI_DB="$(_sqlset subURI)"
+if [ -n "$_PUB" ]; then
+    echo "📎 آدرس درست ساب روی این دامنه: https://${_PUB}${_SUB_EFF}<subId>"
+fi
+if [ -z "$_PUB" ]; then
+    echo "ℹ️  برای دیدن آدرس درست ساب: Railway → Settings → Networking → Generate Domain"
+fi
+case "$_SUB_URI_DB" in
+    "")
+        echo "⚠️  در پنل، «Subscription URI» خالی است ⇒ پنل خودش لینک می‌سازد و با پیش‌فرض‌های"
+        echo "    SubPort=2096 آن لینک از بیرون باز نمی‌شود. برای درست‌شدن لینک‌ها:"
+        echo "    پنل → Settings → Subscription → Sub Port = 443"
+        echo "                                   Subscription URI = https://${_PUB:-دامنهٔ-خودت}${_SUB_EFF}"
+        ;;
+    *:2096*|http://*)
+        echo "⚠️  «Subscription URI» فعلی پنل («$_SUB_URI_DB») از بیرون باز نمی‌شود."
+        echo "    درستش: پنل → Settings → Subscription → Subscription URI = https://${_PUB:-دامنهٔ-خودت}${_SUB_EFF}"
+        ;;
+esac
+if [ -n "$_subdom" ]; then
+    echo "⚠️  «Sub Domain» در پنل روی «$_subdom» است ⇒ سرور ساب فقط با همین دامنه جواب می‌دهد."
+    echo "    اگر با دامنهٔ دیگری ساب می‌گیری، این فیلد را خالی کن."
+fi
 echo "▶️  Starting x-ui in background..."
 ./x-ui &
 X_UI_PID=$!
@@ -324,6 +355,11 @@ export XUI_PID="$X_UI_PID"
 # تا IP واقعی کاربرها ثبت شود و لازم نباشد دستی ست کنید.
 if [ "${XUI_AUTO_SOCKOPT:-true}" = "true" ]; then
     /auto-sockopt.sh &
+fi
+
+# نگهبان مسیر ساب: اگر مسیر ساب در پنل عوض شود، nginx را بدون Redeploy ریلود می‌کند
+if [ "${XUI_SUB_WATCH:-true}" = "true" ] && [ -x /sub-path-watch.sh ]; then
+    /sub-path-watch.sh &
 fi
 
 sleep 2
