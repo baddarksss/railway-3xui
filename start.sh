@@ -84,11 +84,12 @@ fi
 # nginx در لحظهٔ شروع هر اتصال و در لحظهٔ پایانش، یک درخواست کوتاه به ربات
 # می‌فرستد تا ربات بفهمد آن کاربر (با آن IP) روی کدام اینباند وصل شده است.
 #
-# آدرس پوش به‌صورت پیش‌فرض همین‌جا داخل سورس است ⇒ هیچ متغیری لازم نیست.
-#   • خاموش کردن: متغیر IB_PUSH_URL را برابر off بگذارید.
-#   • آدرس دیگر: متغیر IB_PUSH_URL را برابر آدرس پوش خودتان بگذارید.
+# 🔑 آدرس پوش از «متغیر محیطی» خوانده می‌شود و هیچ آدرس/کلیدی داخل سورس نیست:
+#      Railway → سرویس پنل → Variables → IB_PUSH_URL = آدرس پوش
+#   • آدرس را از کج بگیرم؟ در ربات: «🔐 امنیت و کلیدها» → «🔌 رویداد اینباند (پوش پنل)»
+#   • خاموش کردن: متغیر IB_PUSH_URL را برابر off بگذارید (یا متغیر را نسازید).
 # اگر خاموش باشد، هر دو فایل «return 204» می‌شوند (هیچ ارسالی، رفتار پنل مثل قبل).
-IB_PUSH_URL_DEFAULT="https://noisy-silence-aee4.guts-nuclei-sloped.workers.dev/ib?k=11qrasumv2ua20sy0ks63c67k3i4jm2qg0a2aktf"
+IB_PUSH_URL_DEFAULT=""   # ← عمداً خالی: سورس هیچ کلید شخصی ندارد
 _esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 mkdir -p /etc/nginx/ib
 printf 'return 204;\n' > /etc/nginx/ib/push_start.conf
@@ -96,6 +97,12 @@ printf 'return 204;\n' > /etc/nginx/ib/push_close.conf
 
 IB_PUSH_URL_EFF="${IB_PUSH_URL:-$IB_PUSH_URL_DEFAULT}"
 case "$IB_PUSH_URL_EFF" in off|OFF|none|NONE|0|"") IB_PUSH_URL_EFF="";; esac
+
+if [ -z "$IB_PUSH_URL_EFF" ]; then
+    echo "⚪️  رویدادهای اینباند: خاموش (متغیر IB_PUSH_URL ست نشده) — پنل و کانفیگ‌ها عادی کار می‌کنند."
+    echo "    برای روشن‌کردن: Railway → Variables → IB_PUSH_URL = آدرس پوش ربات"
+    echo "    (آدرس را از ربات بگیر: امنیت و کلیدها → رویداد اینباند)"
+fi
 
 if [ -n "$IB_PUSH_URL_EFF" ]; then
     IB_BASE="${IB_PUSH_URL_EFF%%\?*}"            # https://host/path
@@ -135,6 +142,19 @@ NGINXCONF
                     s|__HOST__|$(_esc "$IB_HOST")|" "/etc/nginx/ib/push_$_ev.conf"
         done
         echo "✅ رویدادهای اینباند فعال شد (مقصد: $IB_HOST)"
+        # 🩺 تست سلامت کلید پوش (اختیاری): اگر کلید اشتباه/باطل باشد، همین‌جا در
+        #    لاگ هشدار می‌بینید — نه بعد از ساعت‌ها سکوت. هیچ حالتی ذخیره نمی‌شود.
+        if command -v curl >/dev/null 2>&1; then
+            _ibcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "${IB_PREFIX}&selftest=1" 2>/dev/null || echo 000)"
+            case "$_ibcode" in
+                204) echo "✅ تست کلید پوش: موفق (رویدادهای اینباند آماده‌اند)" ;;
+                403) echo "⛔ تست کلید پوش: کلید نامعتبر است ⇒ رویدادهای اینباند کار نمی‌کند."
+                     echo "    آدرس تازه را از ربات بگیر (امنیت و کلیدها → رویداد اینباند)، متغیر IB_PUSH_URL را به‌روز کن و Redeploy بزن."
+                     ;;
+                000|"") echo "ℹ️ تست کلید پوش انجام نشد (شبکهٔ خروجی در لحظهٔ بوت آماده نبود) — ایرادی نیست." ;;
+                *) echo "ℹ️ تست کلید پوش: پاسخ غیرمنتظرهٔ $_ibcode" ;;
+            esac
+        fi
     fi
 fi
 
