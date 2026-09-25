@@ -38,8 +38,7 @@ RUN rm -f /etc/fail2ban/jail.d/alpine-ssh.conf \
 COPY nginx.conf.template /etc/nginx/nginx.conf.template
 COPY start.sh /start.sh
 COPY auto-sockopt.sh /auto-sockopt.sh
-COPY sub-path-watch.sh /sub-path-watch.sh
-RUN chmod +x /start.sh /auto-sockopt.sh /sub-path-watch.sh
+RUN chmod +x /start.sh /auto-sockopt.sh
 
 # --- متغیرهای محیطی مورد نیاز نسخه 3.8.x ---
 ENV TZ=Asia/Tehran
@@ -58,8 +57,8 @@ ENV XUI_SKIP_HSTS="true"
 # برای خاموش کردن: XUI_AUTO_SOCKOPT=false
 # توجه: مقدار این متغیر «نام هدر» است نه آدرس IP — Xray همین را چک می‌کند.
 ENV XUI_AUTO_SOCKOPT="true"
-# نگهبان مسیر ساب: هم‌گام‌سازی زندهٔ nginx با تغییرات Sub Path در پنل
-# برای خاموش کردن: XUI_SUB_WATCH=false
+# نگهبان مسیر ساب (داخل خودِ start.sh): هم‌گام‌سازی زندهٔ nginx با تغییرات
+# Sub Path و Sub Port در پنل، بدون Redeploy. برای خاموش کردن: XUI_SUB_WATCH=false
 ENV XUI_SUB_WATCH="true"
 ENV XUI_TRUSTED_XFF="X-Forwarded-For"
 ENV XUI_DB_TYPE=""
